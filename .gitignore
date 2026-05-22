@@ -1,0 +1,19 @@
+# Credentials — never commit
+.env
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+briefing-runner.log
+
+# Backup / temp files (name-clash copies created by editors)
+server\ (#*
+
+# Claude Code session data (local only)
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

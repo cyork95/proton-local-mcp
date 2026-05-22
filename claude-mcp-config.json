@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "proton-standard-notes": {
+      "command": "node",
+      "args": ["--dns-result-order=ipv4first", "C:\\Users\\coyof\\Documents\\Claude\\Claude Code\\Proton Local MCP\\server.js"],
+      "env": {
+        "NODE_OPTIONS": "--experimental-vm-modules"
+      }
+    }
+  }
+}

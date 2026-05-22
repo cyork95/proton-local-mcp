@@ -1,0 +1,19 @@
+{
+  "name": "proton-standard-notes-mcp",
+  "version": "1.0.0",
+  "description": "Self-hosted MCP server for Proton Mail (via Bridge) and Standard Notes",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --dns-result-order=ipv4first server.js",
+    "test": "node --dns-result-order=ipv4first test-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.7.0",
+    "better-sqlite3": "^12.10.0",
+    "dotenv": "^16.4.0",
+    "imapflow": "^1.0.0",
+    "node-ical": "^0.26.1"
+  }
+}
