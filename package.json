@@ -1,7 +1,7 @@
 {
-  "name": "proton-standard-notes-mcp",
+  "name": "personal-mcp",
   "version": "1.0.0",
-  "description": "Self-hosted MCP server connecting Claude to Google (Gmail, Calendar, Drive, Tasks, Health) and Standard Notes",
+  "description": "Self-hosted MCP server connecting Claude to your personal stack — Google (Gmail, Calendar, Drive, Tasks, Health), Standard Notes, Spotify, Steam, crypto, mining, and more",
   "type": "module",
   "main": "server.js",
   "scripts": {

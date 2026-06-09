@@ -1,6 +1,6 @@
-# Proton Local MCP
+# Personal MCP
 
-A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude to your personal productivity stack — Proton Mail, Proton Calendar, Standard Notes, Spotify, health data, Steam, crypto mining, and more. Everything runs on your machine. Your credentials never leave it.
+A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude to your entire personal stack — Gmail, Google Calendar, Google Drive, Google Tasks, health data, Standard Notes, Spotify, Steam, Hevy, Duolingo, crypto mining, and more. Everything runs on your machine. Your credentials never leave it.
 
 Built for [Claude Desktop](https://claude.ai/download) and [Claude Code](https://claude.ai/code).
 
@@ -92,27 +92,31 @@ Short version:
 
 ```powershell
 # 1. Clone and install
-git clone https://github.com/YOUR_USERNAME/proton-local-mcp.git
-cd proton-local-mcp
+git clone https://github.com/YOUR_USERNAME/personal-mcp.git
+cd personal-mcp
 npm install
 
 # 2. Configure credentials
 Copy-Item .env.example .env
 notepad .env          # fill in your credentials
 
-# 3. Smoke test
+# 3. Authorize Google (one-time — opens a browser)
+node --dns-result-order=ipv4first health-auth.js
+# Paste the printed GOOGLE_REFRESH_TOKEN into .env
+
+# 4. Smoke test
 npm test
 
-# 4. Register with Claude Desktop
+# 5. Register with Claude Desktop
 # Add to %APPDATA%\Claude\claude_desktop_config.json:
 #   "mcpServers": {
-#     "proton-standard-notes": {
+#     "personal-mcp": {
 #       "command": "node",
-#       "args": ["--dns-result-order=ipv4first", "C:\\path\\to\\proton-local-mcp\\server.js"]
+#       "args": ["--dns-result-order=ipv4first", "C:\\path\\to\\personal-mcp\\server.js"]
 #     }
 #   }
 
-# 5. Restart Claude Desktop
+# 6. Restart Claude Desktop
 ```
 
 After restarting, the tools appear automatically. Try asking Claude: *"Give me my daily briefing."*

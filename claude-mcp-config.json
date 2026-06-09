@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "proton-standard-notes": {
+    "personal-mcp": {
       "command": "node",
       "args": ["--dns-result-order=ipv4first", "C:\\Users\\coyof\\Documents\\Claude\\Claude Code\\Proton Local MCP\\server.js"],
       "env": {

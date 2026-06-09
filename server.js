@@ -4050,7 +4050,7 @@ async function handleTool(name, args) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "proton-standard-notes-mcp", version: "1.0.0" },
+  { name: "personal-mcp", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 
