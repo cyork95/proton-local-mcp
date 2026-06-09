@@ -4,9 +4,6 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { ImapFlow } from "imapflow";
-import ical from "node-ical";
-import axios from "axios";
 import { readdir, stat } from "node:fs/promises";
 import { join, extname, relative, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,171 +15,121 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenvConfig({ path: join(__dirname, ".env") });
 
 // ---------------------------------------------------------------------------
-// Proton Bridge IMAP helpers
+// Gmail API helpers (replaces Proton Bridge IMAP)
 // ---------------------------------------------------------------------------
 
-function makeImapClient() {
-  return new ImapFlow({
-    host: process.env.BRIDGE_IMAP_HOST ?? "127.0.0.1",
-    port: Number(process.env.BRIDGE_IMAP_PORT ?? 1143),
-    secure: process.env.BRIDGE_IMAP_SECURE === "true",
-    tls: { rejectUnauthorized: false }, // Bridge uses a self-signed cert locally
-    auth: {
-      user: process.env.BRIDGE_EMAIL,
-      pass: process.env.BRIDGE_PASSWORD,
-    },
-    logger: false,       // suppress verbose logs from MCP stdio
-  });
+function gmailHeader(msg, name) {
+  return msg.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
-async function withImap(fn) {
-  const client = makeImapClient();
-  await client.connect();
-  try {
-    return await fn(client);
-  } finally {
-    await client.logout();
+function decodeGmailBody(payload) {
+  if (!payload) return "";
+  if (payload.body?.data) return Buffer.from(payload.body.data, "base64url").toString("utf-8");
+  const parts = payload.parts ?? [];
+  for (const part of parts) {
+    if (part.mimeType === "text/plain" && part.body?.data)
+      return Buffer.from(part.body.data, "base64url").toString("utf-8");
   }
-}
-
-async function listMailboxes() {
-  return withImap(async (client) => {
-    const boxes = await client.list();
-    return boxes.map((box) => ({ path: box.path, name: box.name, flags: [...(box.flags ?? [])] }));
-  });
-}
-
-async function fetchMessages(mailbox = "INBOX", limit = 20, search = null) {
-  return withImap(async (client) => {
-    await client.mailboxOpen(mailbox, { readOnly: true });
-
-    const criteria = search
-      ? { or: [{ subject: search }, { from: search }, { body: search }] }
-      : { all: true };
-    const uids = await client.search(criteria, { uid: true });
-
-    const slice = uids.slice(-limit).reverse();
-    if (slice.length === 0) return [];
-
-    const messages = [];
-    for await (const msg of client.fetch(
-      slice,
-      { uid: true, envelope: true, flags: true },
-      { uid: true }
-    )) {
-      messages.push({
-        uid: msg.uid,
-        subject: msg.envelope.subject ?? "(no subject)",
-        from: msg.envelope.from?.[0]?.address ?? "",
-        date: msg.envelope.date?.toISOString() ?? "",
-        seen: msg.flags.has("\\Seen"),
-      });
+  for (const part of parts) {
+    if (part.mimeType === "text/html" && part.body?.data)
+      return Buffer.from(part.body.data, "base64url").toString("utf-8");
+    if (part.mimeType?.startsWith("multipart/")) {
+      const nested = decodeGmailBody(part);
+      if (nested) return nested;
     }
-    return messages;
-  });
+  }
+  return "";
 }
 
-async function fetchMessageBody(mailbox = "INBOX", uid) {
-  return withImap(async (client) => {
-    await client.mailboxOpen(mailbox, { readOnly: true });
-
-    let result = null;
-    for await (const msg of client.fetch(
-      [uid],
-      { uid: true, envelope: true, bodyParts: ["TEXT"] },
-      { uid: true }
-    )) {
-      const bodyPart = msg.bodyParts?.get("TEXT");
-      result = {
-        uid: msg.uid,
-        subject: msg.envelope.subject ?? "(no subject)",
-        from: msg.envelope.from?.[0]?.address ?? "",
-        to: msg.envelope.to?.map((a) => a.address) ?? [],
-        date: msg.envelope.date?.toISOString() ?? "",
-        body: bodyPart ? bodyPart.toString("utf-8") : "(body unavailable)",
-      };
-    }
-    if (!result) throw new Error(`Message UID ${uid} not found in ${mailbox}`);
-    return result;
-  });
+async function fetchGmailUnread(hours = 24) {
+  const after = Math.floor((Date.now() - hours * 3_600_000) / 1000);
+  const q = encodeURIComponent(`is:unread in:inbox after:${after}`);
+  const list = await googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=50`);
+  const ids = (list.messages ?? []).map(m => m.id);
+  if (ids.length === 0) return [];
+  const msgs = await Promise.all(ids.slice(0, 30).map(id =>
+    googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From,Subject,Date`).catch(() => null)
+  ));
+  return msgs.filter(Boolean).map(msg => ({
+    id: msg.id,
+    subject: gmailHeader(msg, "Subject") || "(no subject)",
+    from: gmailHeader(msg, "From"),
+    date: gmailHeader(msg, "Date"),
+    snippet: msg.snippet ?? "",
+  })).sort((a, b) => new Date(b.date) - new Date(a.date));
 }
 
-// Fetch unread messages from the last N hours (used by daily briefing).
-async function fetchRecentUnread(mailbox = "INBOX", hours = 24) {
-  return withImap(async (client) => {
-    await client.mailboxOpen(mailbox, { readOnly: true });
+async function fetchGmailMessages(query = "", limit = 20) {
+  const q = encodeURIComponent(query || "in:inbox");
+  const list = await googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=${Math.min(limit, 50)}`);
+  const ids = (list.messages ?? []).map(m => m.id);
+  if (ids.length === 0) return [];
+  const msgs = await Promise.all(ids.map(id =>
+    googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From,To,Subject,Date`).catch(() => null)
+  ));
+  return msgs.filter(Boolean).map(msg => ({
+    id: msg.id,
+    subject: gmailHeader(msg, "Subject") || "(no subject)",
+    from: gmailHeader(msg, "From"),
+    to: gmailHeader(msg, "To"),
+    date: gmailHeader(msg, "Date"),
+    snippet: msg.snippet ?? "",
+    labels: msg.labelIds ?? [],
+  }));
+}
 
-    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-    const uids = await client.search({ unseen: true, since }, { uid: true });
-    if (uids.length === 0) return [];
+async function fetchGmailMessageBody(messageId) {
+  const msg = await googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`);
+  return {
+    id: msg.id,
+    subject: gmailHeader(msg, "Subject") || "(no subject)",
+    from: gmailHeader(msg, "From"),
+    to: gmailHeader(msg, "To"),
+    date: gmailHeader(msg, "Date"),
+    body: decodeGmailBody(msg.payload).slice(0, 5000),
+    snippet: msg.snippet ?? "",
+  };
+}
 
-    const messages = [];
-    for await (const msg of client.fetch(
-      uids,
-      { uid: true, envelope: true, flags: true },
-      { uid: true }
-    )) {
-      messages.push({
-        uid: msg.uid,
-        subject: msg.envelope.subject ?? "(no subject)",
-        from: msg.envelope.from?.[0]?.address ?? "",
-        date: msg.envelope.date?.toISOString() ?? "",
-      });
-    }
-    // Most recent first
-    return messages.sort((a, b) => new Date(b.date) - new Date(a.date));
-  });
+async function fetchGmailLabels() {
+  const res = await googleGet("https://gmail.googleapis.com/gmail/v1/users/me/labels");
+  return (res.labels ?? []).map(l => ({ id: l.id, name: l.name, type: l.type }));
 }
 
 // ---------------------------------------------------------------------------
-// Proton Calendar (ICS share links)
+// Google Calendar API (replaces Proton Calendar ICS)
 // ---------------------------------------------------------------------------
 
-function getIcsUrls() {
-  const raw = process.env.PROTON_CALENDAR_ICS_URLS ?? "";
-  return raw
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
-}
+async function fetchGoogleCalendarEvents(startDate, endDate) {
+  // Fetch all non-hidden calendars
+  const calList = await googleGet("https://www.googleapis.com/calendar/v3/users/me/calendarList?showHidden=false&minAccessRole=reader");
+  const calendars = (calList.items ?? []).filter(c => c.selected !== false);
 
-// Fetch and parse all configured ICS calendars, return events in a date range.
-async function fetchCalendarEvents(startDate, endDate) {
-  const urls = getIcsUrls();
-  if (urls.length === 0) return [];
+  const timeMin = encodeURIComponent(startDate.toISOString());
+  const timeMax = encodeURIComponent(endDate.toISOString());
 
   const allEvents = [];
-
-  for (const url of urls) {
-    let data;
+  await Promise.all(calendars.map(async (cal) => {
     try {
-      data = await ical.async.fromURL(url);
-    } catch (err) {
-      allEvents.push({ error: `Failed to fetch calendar: ${err.message}`, url });
-      continue;
-    }
-
-    for (const [, entry] of Object.entries(data)) {
-      if (entry.type !== "VEVENT") continue;
-
-      const start = entry.start ? new Date(entry.start) : null;
-      const end = entry.end ? new Date(entry.end) : null;
-
-      if (!start) continue;
-
-      // Include if event overlaps the requested window
-      const eventEnd = end ?? start;
-      if (eventEnd < startDate || start > endDate) continue;
-
-      allEvents.push({
-        summary: entry.summary ?? "(no title)",
-        start: start.toISOString(),
-        end: end ? end.toISOString() : null,
-        location: entry.location ?? null,
-        description: entry.description ? entry.description.slice(0, 300) : null,
-      });
-    }
-  }
+      const evRes = await googleGet(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime&maxResults=50`
+      );
+      for (const ev of evRes.items ?? []) {
+        const start = ev.start?.dateTime ?? ev.start?.date;
+        const end   = ev.end?.dateTime   ?? ev.end?.date;
+        if (!start) continue;
+        allEvents.push({
+          summary:     ev.summary ?? "(no title)",
+          start:       new Date(start).toISOString(),
+          end:         end ? new Date(end).toISOString() : null,
+          location:    ev.location ?? null,
+          description: ev.description ? ev.description.slice(0, 300) : null,
+          calendar:    cal.summary ?? cal.id,
+          all_day:     !ev.start?.dateTime,
+        });
+      }
+    } catch { /* skip calendars we can't read */ }
+  }));
 
   return allEvents.sort((a, b) => new Date(a.start) - new Date(b.start));
 }
@@ -216,12 +163,11 @@ async function enteRecentMedia(since, limit = 50) {
 }
 
 // ---------------------------------------------------------------------------
-// Proton Drive (local sync folder)
+// walkDrive — recursive folder walker (used by Ente Photos)
 // ---------------------------------------------------------------------------
 
-const DRIVE_ROOT = process.env.PROTON_DRIVE_PATH ?? "C:\\Users\\coyof\\Proton Drive\\CoYoFroYos\\My files";
-
-// Recursively walk the drive folder, collect files with their stats.
+// Recursively walk a folder, collect files with their stats.
+// Still used by enteRecentMedia — do not remove.
 async function walkDrive(dir, results = [], depth = 0) {
   if (depth > 6) return results; // guard against deeply nested trees
   let entries;
@@ -238,7 +184,7 @@ async function walkDrive(dir, results = [], depth = 0) {
       try {
         const s = await stat(fullPath);
         results.push({
-          path: relative(DRIVE_ROOT, fullPath).replace(/\\/g, "/"),
+          path: relative(dir, fullPath).replace(/\\/g, "/"),
           size_bytes: s.size,
           modified: s.mtime.toISOString(),
           ext: extname(entry.name).toLowerCase(),
@@ -251,21 +197,38 @@ async function walkDrive(dir, results = [], depth = 0) {
   return results;
 }
 
-async function driveRecentFiles(since, limit = 20) {
-  const all = await walkDrive(DRIVE_ROOT);
-  return all
-    .filter((f) => new Date(f.modified) >= since)
-    .sort((a, b) => new Date(b.modified) - new Date(a.modified))
-    .slice(0, limit);
+// ---------------------------------------------------------------------------
+// Google Drive API (replaces Proton Drive local folder walk)
+// ---------------------------------------------------------------------------
+
+async function fetchGoogleDriveRecent(since, limit = 20) {
+  const fields  = encodeURIComponent("files(id,name,mimeType,modifiedTime,size,webViewLink)");
+  const q       = encodeURIComponent(`modifiedTime>'${since.toISOString()}' and trashed=false`);
+  const res = await googleGet(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime+desc&fields=${fields}&pageSize=${Math.min(limit, 100)}`
+  );
+  return (res.files ?? []).map(f => ({
+    name: f.name,
+    type: f.mimeType?.split(".").pop() ?? f.mimeType,
+    modified: f.modifiedTime,
+    size_bytes: f.size ? parseInt(f.size) : null,
+    url: f.webViewLink ?? null,
+  }));
 }
 
-async function driveSearch(query) {
-  const all = await walkDrive(DRIVE_ROOT);
-  const q = query.toLowerCase();
-  return all
-    .filter((f) => f.path.toLowerCase().includes(q))
-    .sort((a, b) => new Date(b.modified) - new Date(a.modified))
-    .slice(0, 30);
+async function searchGoogleDrive(query) {
+  const q      = encodeURIComponent(`name contains '${query.replace(/'/g, "\\'")}' and trashed=false`);
+  const fields  = encodeURIComponent("files(id,name,mimeType,modifiedTime,size,webViewLink)");
+  const res = await googleGet(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime+desc&fields=${fields}&pageSize=30`
+  );
+  return (res.files ?? []).map(f => ({
+    name: f.name,
+    type: f.mimeType?.split(".").pop() ?? f.mimeType,
+    modified: f.modifiedTime,
+    size_bytes: f.size ? parseInt(f.size) : null,
+    url: f.webViewLink ?? null,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +464,7 @@ function generateDayCommentary({ date, weather, moonPhase, events, unread, spoti
   }
   if (enteMedia.length >= 20) did.push(`synced ${enteMedia.length} photos/videos to Ente`);
   else if (enteMedia.length > 0) did.push(`added ${enteMedia.length} photo${enteMedia.length > 1 ? "s" : ""} to Ente`);
-  if (driveFiles.length > 0) did.push(`updated ${driveFiles.length} file${driveFiles.length > 1 ? "s" : ""} on Proton Drive`);
+  if (driveFiles.length > 0) did.push(`updated ${driveFiles.length} file${driveFiles.length > 1 ? "s" : ""} on Google Drive`);
   if (recentNotes?.length > 0) did.push(`wrote ${recentNotes.length} note${recentNotes.length > 1 ? "s" : ""}`);
   const orders = receipts?.filter(r => r.type === "order") ?? [];
   if (orders.length > 0) {
@@ -761,51 +724,51 @@ async function fetchSpotifyRecommendations({ weather, mood, health, steam, hevyW
 }
 
 // ---------------------------------------------------------------------------
-// Google Health API (replacement for Fitbit Web API, migrating end of May 2026)
+// Google API — unified OAuth token (Health, Gmail, Calendar, Drive, Tasks)
 // ---------------------------------------------------------------------------
 
-let healthAccessToken = null;
-let healthTokenExpiry = 0;
+let googleAccessToken = null;
+let googleTokenExpiry = 0;
 
-async function healthRefreshAccessToken() {
-  const clientId     = process.env.GOOGLE_HEALTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_HEALTH_CLIENT_SECRET;
-  const refreshToken = process.env.GOOGLE_HEALTH_REFRESH_TOKEN;
+async function googleRefreshToken() {
+  const clientId     = process.env.GOOGLE_CLIENT_ID     ?? process.env.GOOGLE_HEALTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_HEALTH_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN ?? process.env.GOOGLE_HEALTH_REFRESH_TOKEN;
   if (!clientId || !clientSecret || !refreshToken)
-    throw new Error("Google Health credentials not configured. Run health-auth.js to set up.");
-
+    throw new Error("Google credentials not configured. Run health-auth.js to set up.");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id:     clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type:    "refresh_token",
-    }),
+    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
+      refresh_token: refreshToken, grant_type: "refresh_token" }),
+    signal: AbortSignal.timeout(10000),
   });
-  if (!res.ok) throw new Error(`Google Health token refresh failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Google token refresh failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  healthAccessToken = data.access_token;
-  healthTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  return healthAccessToken;
+  googleAccessToken = data.access_token;
+  googleTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return googleAccessToken;
 }
 
-async function healthGet(url) {
-  if (!healthAccessToken || Date.now() >= healthTokenExpiry) await healthRefreshAccessToken();
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${healthAccessToken}` } });
-  if (!res.ok) throw new Error(`Google Health API error ${res.status}: ${url}`);
+async function googleGet(url) {
+  if (!googleAccessToken || Date.now() >= googleTokenExpiry) await googleRefreshToken();
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${googleAccessToken}` },
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!res.ok) throw new Error(`Google API ${res.status}: ${url}`);
   return res.json();
 }
 
-async function healthPost(url, body) {
-  if (!healthAccessToken || Date.now() >= healthTokenExpiry) await healthRefreshAccessToken();
+async function googlePost(url, body) {
+  if (!googleAccessToken || Date.now() >= googleTokenExpiry) await googleRefreshToken();
   const res = await fetch(url, {
     method: "POST",
-    headers: { Authorization: `Bearer ${healthAccessToken}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${googleAccessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000),
   });
-  if (!res.ok) throw new Error(`Google Health API error ${res.status}: ${url}`);
+  if (!res.ok) throw new Error(`Google API ${res.status}: ${url}`);
   return res.json();
 }
 
@@ -824,12 +787,12 @@ async function fetchHealthDay(dateStr) {
   const body  = { range, windowSizeDays: 1 };
 
   const [stepsRes, calsRes, activeRes, hrRes, sleepRes] = await Promise.allSettled([
-    healthPost(`${BASE}/steps/dataPoints:dailyRollUp`, body),
-    healthPost(`${BASE}/total-calories/dataPoints:dailyRollUp`, body),
-    healthPost(`${BASE}/active-minutes/dataPoints:dailyRollUp`, body),
-    healthPost(`${BASE}/heart-rate/dataPoints:dailyRollUp`, body),
+    googlePost(`${BASE}/steps/dataPoints:dailyRollUp`, body),
+    googlePost(`${BASE}/total-calories/dataPoints:dailyRollUp`, body),
+    googlePost(`${BASE}/active-minutes/dataPoints:dailyRollUp`, body),
+    googlePost(`${BASE}/heart-rate/dataPoints:dailyRollUp`, body),
     // Sleep uses list, not dailyRollUp
-    healthGet(`${BASE}/sleep/dataPoints?startTime=${dateStr}T00:00:00&endTime=${dateStr}T23:59:59`),
+    googleGet(`${BASE}/sleep/dataPoints?startTime=${dateStr}T00:00:00&endTime=${dateStr}T23:59:59`),
   ]);
 
   const val = (res, path) => {
@@ -1408,16 +1371,8 @@ async function fetchHevyWorkouts({ since = null, limit = 10 } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Universal receipt & transaction email scanner
+// Universal receipt & transaction email scanner (Gmail-based)
 // ---------------------------------------------------------------------------
-
-function decodeEmailBody(raw) {
-  return raw
-    .replace(/=\r?\n/g, "")
-    .replace(/=[0-9A-Fa-f]{2}/g, m => String.fromCharCode(parseInt(m.slice(1), 16)))
-    .replace(/\r?\n/g, " ")
-    .replace(/\s{2,}/g, " ");
-}
 
 function extractField(text, patterns) {
   for (const pat of patterns) {
@@ -1427,64 +1382,36 @@ function extractField(text, patterns) {
   return null;
 }
 
-// Guess the merchant/store name from the From header
-function guessStore(raw) {
-  const from = raw.match(/^From:.*$/im)?.[0] ?? "";
-  // Friendly name inside quotes or angle-bracket display
-  const friendly = from.match(/"([^"]+)"/)?.[1] ?? from.match(/From:\s*([^<\n]+)/i)?.[1]?.trim();
-  if (friendly && friendly.length < 60) return friendly.replace(/no.?reply|noreply|alert|notification/gi, "").trim();
-  // Fall back to domain
-  const domain = from.match(/@([\w.-]+)/)?.[1] ?? "";
-  return domain.split(".").slice(-2, -1)[0] ?? "Unknown";
-}
-
 async function fetchAllReceipts(hours = 72) {
-  // Search inbox for anything that looks like a receipt/order/transaction
-  const results = await withImap(async (client) => {
-    await client.mailboxOpen("INBOX", { readOnly: true });
-    const since = new Date(Date.now() - hours * 3_600_000);
+  const after = Math.floor((Date.now() - hours * 3_600_000) / 1000);
+  const subjects = [
+    "order confirmation", "order confirmed", "receipt", "invoice",
+    "has shipped", "shipping confirmation", "out for delivery", "delivered",
+    "your purchase", "payment confirmation", "your receipt",
+  ];
+  const q = encodeURIComponent(
+    `(${subjects.map(s => `subject:"${s}"`).join(" OR ")}) after:${after}`
+  );
+  const list = await googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=30`);
+  const ids  = (list.messages ?? []).map(m => m.id);
+  if (ids.length === 0) return [];
 
-    // Cast a wide net — subject keywords that almost always mean a receipt
-    const subjectTerms = [
-      "order confirmation", "order confirmed", "order receipt",
-      "your order", "order #", "order number",
-      "receipt", "invoice",
-      "has shipped", "shipping confirmation", "shipment",
-      "out for delivery", "delivered",
-      "your purchase", "payment confirmation", "transaction",
-      "your receipt",
-    ];
+  const msgs = await Promise.all(ids.map(id =>
+    googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`).catch(() => null)
+  ));
 
-    // Search for each subject term, collect unique UIDs
-    const uidSet = new Set();
-    for (const term of subjectTerms) {
-      try {
-        const uids = await client.search({ subject: term, since }, { uid: true });
-        uids.forEach(u => uidSet.add(u));
-      } catch { /* skip */ }
-    }
+  return msgs.filter(Boolean).map(msg => {
+    const subject = gmailHeader(msg, "Subject");
+    const from    = gmailHeader(msg, "From");
+    const date    = gmailHeader(msg, "Date");
+    const body    = decodeGmailBody(msg.payload);
 
-    if (uidSet.size === 0) return [];
-
-    // Fetch up to 30 most recent matching messages
-    const uids = [...uidSet].sort((a, b) => b - a).slice(0, 30);
-    const msgs = [];
-    for await (const msg of client.fetch(uids, { source: true, envelope: true })) {
-      msgs.push({
-        raw:      msg.source?.toString() ?? "",
-        subject:  msg.envelope?.subject ?? "",
-        from:     msg.envelope?.from?.[0]?.address ?? "",
-        date:     msg.envelope?.date ?? null,
-      });
-    }
-    return msgs;
-  });
-
-  return results.map(({ raw, subject, from, date }) => {
-    const body = decodeEmailBody(raw);
-
-    // --- Universal field extraction ---
-    const store = guessStore(raw);
+    const store = (() => {
+      const friendly = from.match(/"([^"]+)"/)?.[1] ?? from.match(/^([^<]+)/)?.[1]?.trim();
+      if (friendly && friendly.length < 60) return friendly.replace(/no.?reply|noreply|alert|notification/gi, "").trim();
+      const domain = from.match(/@([\w.-]+)/)?.[1] ?? "";
+      return domain.split(".").slice(-2, -1)[0] ?? "Unknown";
+    })();
 
     const order = extractField(body, [
       /Order\s*(?:#|Number|No\.?|ID)[:\s#]*([\w-]{4,30})/i,
@@ -1492,7 +1419,6 @@ async function fetchAllReceipts(hours = 72) {
       /Invoice\s*(?:#|No\.?)[:\s#]*([\w-]{4,30})/i,
     ]);
 
-    // Total — look for the most prominent dollar amount
     const allAmounts = [...body.matchAll(/\$\s?([\d,]+\.\d{2})/g)].map(m => m[1]);
     const total = allAmounts.length > 0
       ? `$${allAmounts.reduce((max, a) => parseFloat(a.replace(",","")) > parseFloat(max.replace(",","")) ? a : max)}`
@@ -1509,32 +1435,17 @@ async function fetchAllReceipts(hours = 72) {
       /expected\s+by[:\s]+([^\n<.]{3,30})/i,
     ]);
 
-    // For financial transactions (SoFi, bank, credit card alerts)
-    const txnType = body.match(
-      /\b(deposit|withdrawal|transfer|direct deposit|charge|payment|refund|interest|dividend|autopay)\b/i
-    )?.[1] ?? null;
-    const acct = extractField(body, [/account\s+ending\s+in\s+(\d{4})/i, /[*x]{2,}(\d{4})/i]);
-
-    // Skip if nothing useful was extracted
-    if (!order && !total && !txnType) return null;
-
-    // Classify as order vs transaction
-    const isTransaction = !order && txnType;
-
     return {
-      type:     isTransaction ? "transaction" : "order",
+      type:    "order",
       store,
-      subject:  subject.slice(0, 80),
-      from,
-      date:     date ? new Date(date).toISOString() : null,
-      order,
-      total,
-      status,
-      arriving,
-      txn_type: txnType,
-      account_last4: acct,
+      subject: subject.slice(0, 120),
+      order:   order ?? null,
+      total:   total ?? null,
+      status:  status ?? null,
+      arriving: arriving ?? null,
+      date:    date,
     };
-  }).filter(Boolean);
+  }).filter(r => r.store);
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,55 +2098,48 @@ async function fetchMoodNote(dateStr = null) {
 }
 
 // ---------------------------------------------------------------------------
-// Package delivery email parser
+// Package delivery email parser (Gmail-based)
 // Scans the last 48h of email for shipping notifications from major carriers.
 // ---------------------------------------------------------------------------
 
 async function fetchPackageDeliveries(hours = 48) {
-  const messages = await fetchRecentUnread("INBOX", hours);
-  const deliveries = [];
+  const after = Math.floor((Date.now() - hours * 3_600_000) / 1000);
+  const q = encodeURIComponent(
+    `(from:ups.com OR from:fedex.com OR from:usps.com OR from:amazon.com OR from:walmart.com OR from:dhl.com OR "tracking number" OR "your package" OR "has shipped" OR "out for delivery") after:${after}`
+  );
+  const list = await googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`);
+  const ids  = (list.messages ?? []).map(m => m.id);
+  if (ids.length === 0) return [];
+
+  const msgs = await Promise.all(ids.map(id =>
+    googleGet(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From,Subject,Date`).catch(() => null)
+  ));
 
   const carrierPatterns = [
-    { carrier: "UPS",     patterns: [/UPS.*shipped|Your UPS.*package|UPS.*delivery|Tracking Number.*1Z[0-9A-Z]{16}/i] },
-    { carrier: "FedEx",   patterns: [/FedEx.*shipped|FedEx.*delivery|Your.*package.*FedEx/i] },
-    { carrier: "USPS",    patterns: [/USPS.*shipped|informed delivery|USPS.*package|Your package.*USPS/i] },
-    { carrier: "Amazon",  patterns: [/Your.*Amazon.*shipped|Amazon.*delivered|Your package was delivered|order.*shipped.*Amazon/i] },
-    { carrier: "Walmart", patterns: [/Walmart.*shipped|Your Walmart.*order.*shipped/i] },
-    { carrier: "DHL",     patterns: [/DHL.*shipped|DHL.*delivery/i] },
+    { carrier: "UPS",     re: /UPS.*shipped|Your UPS.*package|UPS.*delivery|1Z[0-9A-Z]{16}/i },
+    { carrier: "FedEx",   re: /FedEx.*shipped|FedEx.*delivery|Your.*package.*FedEx/i },
+    { carrier: "USPS",    re: /USPS.*shipped|informed delivery|USPS.*package/i },
+    { carrier: "Amazon",  re: /Your.*Amazon.*shipped|Amazon.*delivered|Your package was delivered/i },
+    { carrier: "Walmart", re: /Walmart.*shipped|Your Walmart.*order/i },
+    { carrier: "DHL",     re: /DHL.*shipped|DHL.*delivery/i },
   ];
 
   const trackingRe = /\b(1Z[0-9A-Z]{16}|[0-9]{12,22}|[A-Z]{2}[0-9]{9}[A-Z]{2})\b/;
 
-  for (const msg of messages) {
-    const subject = msg.subject ?? "";
-    const from    = msg.from ?? "";
-    const haystack = subject + " " + from;
+  return msgs.filter(Boolean).flatMap(msg => {
+    const subject = gmailHeader(msg, "Subject");
+    const from    = gmailHeader(msg, "From");
+    const date    = gmailHeader(msg, "Date");
+    const text    = `${from} ${subject}`;
 
-    for (const { carrier, patterns } of carrierPatterns) {
-      if (patterns.some(p => p.test(haystack))) {
-        const trackingMatch = haystack.match(trackingRe);
-        // Determine status from subject
-        const isDelivered = /delivered|arrived/i.test(subject);
-        const isOutForDelivery = /out for delivery/i.test(subject);
-        deliveries.push({
-          carrier,
-          status:   isDelivered ? "Delivered" : isOutForDelivery ? "Out for delivery" : "Shipped",
-          subject:  subject.slice(0, 100),
-          tracking: trackingMatch?.[0] ?? null,
-          date:     msg.date ?? null,
-        });
-        break; // don't double-count
-      }
-    }
-  }
-
-  // Deduplicate by tracking number
-  const seen = new Set();
-  return deliveries.filter(d => {
-    const key = d.tracking ?? d.subject;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+    const matched = carrierPatterns.filter(({ re }) => re.test(text));
+    return matched.map(({ carrier }) => ({
+      carrier,
+      subject: subject.slice(0, 100),
+      from,
+      date,
+      tracking: trackingRe.exec(subject)?.[1] ?? null,
+    }));
   });
 }
 
@@ -2487,6 +2391,41 @@ async function fetchWisdomBuilder(dateStr) {
 }
 
 // ---------------------------------------------------------------------------
+// Google Tasks API
+// ---------------------------------------------------------------------------
+
+async function fetchGoogleTasks() {
+  const listsRes = await googleGet("https://tasks.googleapis.com/tasks/v1/users/@me/lists?maxResults=20");
+  const taskLists = listsRes.items ?? [];
+  if (taskLists.length === 0) return { total_tasks: 0, lists: [] };
+
+  const results = await Promise.all(taskLists.map(async (list) => {
+    try {
+      const tasksRes = await googleGet(
+        `https://tasks.googleapis.com/tasks/v1/lists/${list.id}/tasks?showCompleted=false&showDeleted=false&maxResults=100`
+      );
+      return {
+        list:       list.title,
+        list_id:    list.id,
+        task_count: (tasksRes.items ?? []).length,
+        tasks:      (tasksRes.items ?? []).map(t => ({
+          id:     t.id,
+          title:  t.title,
+          status: t.status,
+          due:    t.due ?? null,
+          notes:  t.notes ? t.notes.slice(0, 200) : null,
+        })),
+      };
+    } catch { return { list: list.title, list_id: list.id, task_count: 0, tasks: [] }; }
+  }));
+
+  return {
+    total_tasks: results.reduce((s, l) => s + l.task_count, 0),
+    lists: results.filter(l => l.task_count > 0),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
 
@@ -2520,10 +2459,10 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
 
-  // --- Proton Drive ---
+  // --- Google Drive ---
   {
     name: "drive_recent_files",
-    description: "List recently modified files in Proton Drive local sync folder.",
+    description: "List recently modified Google Drive files.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2534,12 +2473,12 @@ const TOOLS = [
   },
   {
     name: "drive_search",
-    description: "Search for files in Proton Drive by name or path keyword.",
+    description: "Search Google Drive files by name.",
     inputSchema: {
       type: "object",
       required: ["query"],
       properties: {
-        query: { type: "string", description: "Filename or path keyword to search for" },
+        query: { type: "string", description: "Filename search keyword" },
       },
     },
   },
@@ -2566,7 +2505,7 @@ const TOOLS = [
   // --- Orders & Transactions (email-parsed) ---
   {
     name: "email_receipts",
-    description: "Scan Proton Mail for any recent order confirmations, shipping notices, receipts, invoices, and financial transaction alerts from any store or bank. Returns parsed fields: store, order number, total, status, delivery estimate, transaction type.",
+    description: "Scan Gmail for any recent order confirmations, shipping notices, receipts, and invoices from any store. Returns parsed fields: store, order number, total, status, delivery estimate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2700,7 +2639,7 @@ const TOOLS = [
   },
   {
     name: "package_deliveries",
-    description: "Scan Proton Mail for shipping notifications from UPS, FedEx, USPS, Amazon, Walmart, and DHL in the last 48 hours.",
+    description: "Scan Gmail for shipping notifications from UPS, FedEx, USPS, Amazon, Walmart, and DHL in the last 48 hours.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2818,54 +2757,54 @@ const TOOLS = [
     },
   },
 
-  // --- Proton Calendar ---
+  // --- Gmail ---
   {
-    name: "proton_list_events",
-    description: "List Proton Calendar events within a date range (reads from shared ICS links).",
+    name: "gmail_messages",
+    description: "Search Gmail messages. Returns sender, subject, date, snippet, and label IDs. Uses Gmail search syntax (e.g. 'is:unread from:boss@company.com', 'subject:invoice newer_than:7d').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Gmail search query. Default: recent inbox messages.", default: "in:inbox" },
+        limit: { type: "number", description: "Max messages to return (1–50). Default: 20", default: 20 },
+      },
+    },
+  },
+  {
+    name: "gmail_get_message",
+    description: "Get the full body of a Gmail message by its ID.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string", description: "Message ID from gmail_messages" },
+      },
+    },
+  },
+  {
+    name: "gmail_labels",
+    description: "List all Gmail labels (folders). Useful for understanding how the inbox is organized.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
+  // --- Google Calendar ---
+  {
+    name: "google_calendar_events",
+    description: "List Google Calendar events in a date range across all calendars.",
     inputSchema: {
       type: "object",
       required: ["start", "end"],
       properties: {
-        start: { type: "string", description: "Start date/time ISO 8601 (e.g. 2026-05-13T00:00:00)" },
-        end: { type: "string", description: "End date/time ISO 8601 (e.g. 2026-05-13T23:59:59)" },
+        start: { type: "string", description: "Start date/time ISO 8601 (e.g. 2026-05-18T00:00:00)" },
+        end:   { type: "string", description: "End date/time ISO 8601 (e.g. 2026-05-18T23:59:59)" },
       },
     },
   },
 
-  // --- Proton Mail (via Bridge IMAP) ---
+  // --- Google Tasks ---
   {
-    name: "proton_list_mailboxes",
-    description: "List all Proton Mail folders/mailboxes (INBOX, Sent, Trash, custom folders, etc.).",
+    name: "google_tasks",
+    description: "List all Google Tasks across all task lists. Returns incomplete tasks only.",
     inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "proton_list_messages",
-    description:
-      "List recent Proton Mail messages from a folder. Returns sender, subject, date, and read status.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        mailbox: {
-          type: "string",
-          description: "Folder path from proton_list_mailboxes (e.g. INBOX, Sent). Default: INBOX",
-          default: "INBOX",
-        },
-        limit: { type: "number", description: "Max messages to return (1-100). Default: 20", default: 20 },
-        search: { type: "string", description: "Optional keyword to filter by subject, sender, or body" },
-      },
-    },
-  },
-  {
-    name: "proton_get_message",
-    description: "Get the full body of a Proton Mail message by its UID.",
-    inputSchema: {
-      type: "object",
-      required: ["uid"],
-      properties: {
-        uid: { type: "number", description: "Message UID from proton_list_messages" },
-        mailbox: { type: "string", description: "Folder the message is in. Default: INBOX", default: "INBOX" },
-      },
-    },
   },
 
   // --- Standard Notes ---
@@ -3029,12 +2968,11 @@ async function handleTool(name, args) {
 
     case "drive_recent_files": {
       const since = new Date(Date.now() - (args.hours ?? 24) * 60 * 60 * 1000);
-      const files = await driveRecentFiles(since, args.limit ?? 20);
-      return JSON.stringify(files, null, 2);
+      return JSON.stringify(await fetchGoogleDriveRecent(since, args.limit ?? 20), null, 2);
     }
 
     case "drive_search": {
-      return JSON.stringify(await driveSearch(args.query), null, 2);
+      return JSON.stringify(await searchGoogleDrive(args.query), null, 2);
     }
 
     case "get_weather": {
@@ -3071,11 +3009,11 @@ async function handleTool(name, args) {
              historyToday, wordOfDay, nwsAlerts, moodNote, packages, airQuality,
              fearAndGreed, cryptoPortfolio, githubActivity, airNowPollen, ryanHallPosts,
              pcHardware, activityHistory, vivaldiNotes] = await Promise.all([
-        withTimeout(fetchCalendarEvents(dayStart, dayEnd),              12000, []),
-        withTimeout(fetchRecentUnread("INBOX", 24),                     12000, []),
+        withTimeout(fetchGoogleCalendarEvents(dayStart, dayEnd),        12000, []),
+        withTimeout(fetchGmailUnread(24),                               12000, []),
         withTimeout(snGetRecentNotes(dayStart),                         12000, []),
         withTimeout(fetchWeather(),                                     12000, { current: { condition:"Unavailable", temperature_f:"?", feels_like_f:"?", humidity_pct:"?", wind_mph:"?" }, forecast: [], today_sunrise: null, today_sunset: null }),
-        withTimeout(driveRecentFiles(dayStart, 20),                     12000, []),
+        withTimeout(fetchGoogleDriveRecent(dayStart, 20),               12000, []),
         withTimeout(enteRecentMedia(dayStart),                          12000, []),
         withTimeout(spotifyRecentlyPlayed(50).catch(()=>[]),            12000, []),
         withTimeout(spotifyCurrentlyPlaying().catch(()=>null),          12000, null),
@@ -3342,14 +3280,14 @@ async function handleTool(name, args) {
       }
       lines.push("");
 
-      // ── Proton Drive ──────────────────────────────────────────────────────
-      lines.push(`## ☁️ Proton Drive`);
+      // ── Google Drive ──────────────────────────────────────────────────────
+      lines.push(`## ☁️ Google Drive`);
       if (driveFiles.length === 0) {
         lines.push("*No files modified today*");
       } else {
         for (const f of driveFiles) {
-          const kb = (f.size_bytes / 1024).toFixed(0);
-          lines.push(`- **${f.path.split("/").pop()}** · ${kb} KB · ${fmtTime(f.modified)}`);
+          const kb = f.size_bytes ? (f.size_bytes / 1024).toFixed(0) + " KB · " : "";
+          lines.push(`- **${f.name}** · ${kb}${fmtTime(f.modified)}`);
         }
       }
 
@@ -3762,26 +3700,23 @@ async function handleTool(name, args) {
       return lines.join("\n");
     }
 
-    case "proton_list_events": {
-      const events = await fetchCalendarEvents(new Date(args.start), new Date(args.end));
+    case "gmail_messages": {
+      return JSON.stringify(await fetchGmailMessages(args.query ?? "in:inbox", args.limit ?? 20), null, 2);
+    }
+    case "gmail_get_message": {
+      return JSON.stringify(await fetchGmailMessageBody(args.id), null, 2);
+    }
+    case "gmail_labels": {
+      return JSON.stringify(await fetchGmailLabels(), null, 2);
+    }
+
+    case "google_calendar_events": {
+      const events = await fetchGoogleCalendarEvents(new Date(args.start), new Date(args.end));
       return JSON.stringify(events, null, 2);
     }
 
-    case "proton_list_mailboxes": {
-      return JSON.stringify(await listMailboxes(), null, 2);
-    }
-
-    case "proton_list_messages": {
-      const messages = await fetchMessages(
-        args.mailbox ?? "INBOX",
-        Math.min(args.limit ?? 20, 100),
-        args.search ?? null
-      );
-      return JSON.stringify(messages, null, 2);
-    }
-
-    case "proton_get_message": {
-      return JSON.stringify(await fetchMessageBody(args.mailbox ?? "INBOX", args.uid), null, 2);
+    case "google_tasks": {
+      return JSON.stringify(await fetchGoogleTasks(), null, 2);
     }
 
     case "sn_list_notes": {
@@ -3850,8 +3785,8 @@ async function handleTool(name, args) {
         moodNote, airQuality, fearAndGreed, cryptoPortfolio, githubActivity,
         pcHardware, activityHistory, vivaldiNotes, wisdomBuilder,
       ] = await Promise.all([
-        withTimeout(fetchCalendarEvents(dayStart, dayEnd),               12000, []),
-        withTimeout(fetchRecentUnread("INBOX", 24),                      12000, []),
+        withTimeout(fetchGoogleCalendarEvents(dayStart, dayEnd),         12000, []),
+        withTimeout(fetchGmailUnread(24),                                12000, []),
         withTimeout(snGetRecentNotes(dayStart),                          12000, []),
         withTimeout(spotifyRecentlyPlayed(50).catch(() => []),           12000, []),
         withTimeout(spotifyCurrentlyPlaying().catch(() => null),         12000, null),
@@ -4136,4 +4071,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("Proton Bridge + Standard Notes MCP server running (stdio)");
+console.error("Google + Standard Notes MCP server running (stdio)");
